@@ -2,7 +2,6 @@ name: Materialize and validate research
 on:
   push:
     paths:
-      - research.bundle.b64
       - research.bundle.sha256
 permissions:
   contents: write
@@ -18,12 +17,14 @@ jobs:
       - name: Verify and materialize source bundle
         run: |
           python - <<'PY'
-          import base64, gzip, hashlib, json
+          import hashlib, json, lzma
           from pathlib import Path, PurePosixPath
-          blob = base64.b64decode(Path('research.bundle.b64').read_text(), validate=False)
+          parts = sorted(Path('.').glob('research.bundle.part-*'))
+          assert parts, 'Missing source bundle'
+          blob = b''.join(p.read_bytes() for p in parts)
           expected = Path('research.bundle.sha256').read_text().strip()
           assert hashlib.sha256(blob).hexdigest() == expected, 'Bundle hash mismatch'
-          files = json.loads(gzip.decompress(blob))
+          files = json.loads(lzma.decompress(blob))
           assert isinstance(files, dict) and len(files) < 200
           for name, text in files.items():
               p = PurePosixPath(name)
@@ -33,6 +34,7 @@ jobs:
               dst = Path(name)
               dst.parent.mkdir(parents=True, exist_ok=True)
               dst.write_text(text, encoding='utf-8')
+          Path('results/local-environment.json').write_bytes(Path('results/environment.json').read_bytes())
           print('Materialized', len(files), 'verified UTF-8 research files')
           PY
       - name: Install scientific dependencies
@@ -42,8 +44,18 @@ jobs:
       - name: Run tests and independent reproduction
         run: |
           python -m pytest -q --junitxml=results/ci-junit.xml
+          python scripts/run_experiments.py --suite full --output results
           python scripts/run_experiments.py --suite full --output /tmp/recovery-ci
           python scripts/verify_results.py results /tmp/recovery-ci --report results/ci-reproduction.json
+          python - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          reference=json.loads(Path('results/reproduction.json').read_text())
+          comparison={name:{'local_sha256':r['sha256'],'runner_sha256':hashlib.sha256((Path('results')/name).read_bytes()).hexdigest()} for name,r in reference.items()}
+          for r in comparison.values(): r['byte_identical']=r['local_sha256']==r['runner_sha256']
+          Path('results/cross-environment-hashes.json').write_text(json.dumps(comparison,indent=2)+'\n')
+          print(json.dumps(comparison,indent=2))
+          PY
       - name: Install LaTeX
         run: |
           sudo apt-get -qq update
@@ -54,7 +66,7 @@ jobs:
           python scripts/build_paper.py
       - name: Commit verified normal research files
         run: |
-          rm research.bundle.b64 research.bundle.sha256
+          rm research.bundle.part-* research.bundle.sha256
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add -A
@@ -65,5 +77,7 @@ jobs:
           name: recovery-research-validation
           path: |
             paper/main.pdf
-            results/ci-reproduction.json
+            results/*.csv
+            results/*reproduction.json
+            results/cross-environment-hashes.json
             results/ci-junit.xml
